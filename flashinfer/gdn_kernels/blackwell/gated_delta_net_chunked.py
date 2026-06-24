@@ -96,6 +96,7 @@ from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
+from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
 
@@ -158,6 +159,21 @@ def _wrap_tma(ret):
         return ret
     # 4.4.2: returns (CopyAtom, Tensor) tuple
     return TmaInfo(ret[0], ret[1])
+
+
+@dsl_user_op
+def _make_state_tmem_load_copy(
+    tmem_copy_atom: cute.CopyAtom, *, loc=None, ip=None
+) -> cute.TiledCopy:
+    layout_tv = cute.make_layout(
+        ((32, 4), (32, 32)),
+        stride=((0, 1), (128, 4)),
+    )
+    tiler_mn = (
+        cute.make_layout((4, 32), stride=(32, 1)),
+        cute.make_layout(32),
+    )
+    return cute.make_tiled_copy(tmem_copy_atom, layout_tv, tiler_mn)
 
 
 from .gated_delta_net_tile_scheduler import (
@@ -2982,7 +2998,7 @@ class GatedDeltaNetChunkedKernel:
         )[None, None, 0, 0]
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
-        for sub in cutlass.range(tRT_tCrState.shape[2]):
+        for sub in cutlass.range_constexpr(tRT_tCrState.shape[2]):
             # 1. Load S_init fp32 GMEM -> fp32 registers
             cute.autovec_copy(
                 tGR_tCgState[None, 0, sub],
@@ -3055,8 +3071,7 @@ class GatedDeltaNetChunkedKernel:
         atom_state_t2r = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
         )
-        tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
-        tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
+        tiled_state_t2r = _make_state_tmem_load_copy(atom_state_t2r)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
         tTR_tCcState = thr_state_t2r.partition_D(tCcState)
@@ -3066,7 +3081,7 @@ class GatedDeltaNetChunkedKernel:
         # Wait for last GEMM-7 to finish
         kv_acc_handle = kv_acc_consumer.wait_and_advance()
 
-        for sub in cutlass.range(tTR_rState.shape[2]):
+        for sub in cutlass.range_constexpr(tTR_rState.shape[2]):
             # Read state TMEM -> fp32 registers
             cute.copy(
                 tiled_state_t2r,
@@ -3176,7 +3191,7 @@ class GatedDeltaNetChunkedKernel:
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
         )
         tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
-        tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
+        tiled_state_t2r = _make_state_tmem_load_copy(atom_state_t2r)
         tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
@@ -3347,7 +3362,7 @@ class GatedDeltaNetChunkedKernel:
             kv_handle = kv_acc_consumer.wait_and_advance()
 
             state_inp_ready_handle = state_inp_ready_producer.acquire_and_advance()
-            for sub in cutlass.range(tRT_rState_inp.shape[2]):
+            for sub in cutlass.range_constexpr(tRT_rState_inp.shape[2]):
                 cute.copy(
                     tiled_state_t2r,
                     tTR_tCtState[None, 0, sub, kv_handle.index],
@@ -3389,7 +3404,7 @@ class GatedDeltaNetChunkedKernel:
             state_inp_ready_handle.commit()
 
             # Load S_prev -> scale by Phi -> write Phi*S_prev back to same TMEM slot.
-            for sub in cutlass.range(tTR_rState.shape[2]):
+            for sub in cutlass.range_constexpr(tTR_rState.shape[2]):
                 for k in cutlass.range(sub_tile_size, vectorize=True):
                     tTR_rState[k, 0, sub] = tTR_rState[k, 0, sub] * cumprod_total
                 cute.copy(
