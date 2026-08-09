@@ -1,0 +1,27 @@
+csrc/flashinfer_page_binding.cu
+  s_9e88db837fdf9d::t_8c80e91986a4c2 36-40
+csrc/page.cu
+  s_9e88db837fdf9d::t_588d0b4580367c 18-19,202-203,247-259,290-294,363-368,410-581,584-598,605-612
+flashinfer/jit/page.py
+  s_9e88db837fdf9d::t_b800adb5e1c782 23
+flashinfer/page.py
+  s_9e88db837fdf9d::t_1b81e7d130dceb 205-207,221-225,227-228,239-243,260-264,551-579,629-630,668-674,808-812,875-880,890-909,925-1111,1123-1127
+include/flashinfer/page.cuh
+  s_9e88db837fdf9d::t_2abd328b0848da 251-322,326-330,333-336,338-345,348-362,375-393,398,400-401,611-798,804-809,825-846,856-863,870-899,907-913,915-916,918-921,966-969,979-989,994-995,1009-1021
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b78599ccc474a6a1efeca22fc53232e6e9fc07e8",
+  "prompts": {},
+  "sessions": {
+    "s_9e88db837fdf9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05fc65619ffe53PiifOjSulftM",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "qimcis <chixie.mcisaac@gmail.com>"
+    }
+  }
+}
