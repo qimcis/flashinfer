@@ -15,6 +15,8 @@
  */
 #include <cmath>
 #include <flashinfer/page.cuh>
+#include <unordered_set>
+#include <vector>
 
 #include "tvm_ffi_utils.h"
 
@@ -197,6 +199,8 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
   TVM_FFI_ICHECK_EQ(packed_head_dim * 2, head_dim);
   TVM_FFI_ICHECK_EQ(scale_dim * 16, head_dim);
   TVM_FFI_ICHECK_EQ(head_dim % 16, 0);
+  TVM_FFI_ICHECK_NE(head_dim, 256)
+      << "H256 NVFP4 append is supported only by the slot-mapping HND API";
 
   auto require_same_shape = [](TensorView lhs, TensorView rhs, const char* name) {
     TVM_FFI_ICHECK_EQ(lhs.ndim(), rhs.ndim()) << name << " ndim mismatch";
@@ -240,6 +244,19 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
   const size_t append_v_stride_n = append_v_strides[0];
   const size_t append_v_stride_h = append_v_strides[1];
 
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(append_key.data_ptr()) % 16, 0);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(append_value.data_ptr()) % 16, 0);
+  for (int i = 0; i < append_key.ndim() - 1; ++i) {
+    TVM_FFI_ICHECK_EQ((append_k_strides[i] * 2) % 16, 0);
+    TVM_FFI_ICHECK_EQ((append_v_strides[i] * 2) % 16, 0);
+  }
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(paged_k_cache.data_ptr()) % 8, 0);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(paged_v_cache.data_ptr()) % 8, 0);
+  for (int i = 0; i < paged_k_cache.ndim() - 1; ++i) {
+    TVM_FFI_ICHECK_EQ(k_strides[i] % 8, 0);
+    TVM_FFI_ICHECK_EQ(v_strides[i] % 8, 0);
+  }
+
   ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
   const cudaStream_t stream = get_stream(append_key.device());
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(append_key.dtype(), c_type, [&] {
@@ -270,7 +287,11 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
 void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     TensorView append_key, TensorView append_value, TensorView slot_mapping,
     TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scale_cache,
-    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale, int64_t layout) {
+    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale,
+    tvm::ffi::Optional<TensorView> q_input, tvm::ffi::Optional<TensorView> q_output,
+    tvm::ffi::Optional<TensorView> context_dst_rows,
+    tvm::ffi::Optional<TensorView> context_k_output,
+    tvm::ffi::Optional<TensorView> context_v_output, int64_t layout) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(slot_mapping);
@@ -339,6 +360,12 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
   TVM_FFI_ICHECK_EQ(packed_head_dim * 2, head_dim);
   TVM_FFI_ICHECK_EQ(scale_dim * 16, head_dim);
   TVM_FFI_ICHECK_EQ(head_dim % 16, 0);
+  if (head_dim == 256) {
+    TVM_FFI_ICHECK(kv_layout == QKVLayout::kHND)
+        << "H256 NVFP4 append requires HND layout for interleaved V scales";
+    TVM_FFI_ICHECK_EQ(page_size % 4, 0)
+        << "H256 NVFP4 append requires page_size divisible by 4 for interleaved V scales";
+  }
 
   auto require_same_shape = [](TensorView lhs, TensorView rhs, const char* name) {
     TVM_FFI_ICHECK_EQ(lhs.ndim(), rhs.ndim()) << name << " ndim mismatch";
@@ -380,15 +407,207 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
   const size_t append_v_stride_n = append_v_strides[0];
   const size_t append_v_stride_h = append_v_strides[1];
 
+  if (head_dim == 256) {
+    TVM_FFI_ICHECK_EQ(v_sf_stride_n, scale_dim) << "H256 V-scale token rows must be dense";
+    TVM_FFI_ICHECK_GE(v_sf_stride_h, page_size * scale_dim)
+        << "H256 V-scale heads must not overlap";
+    TVM_FFI_ICHECK_GE(v_sf_stride_page, num_heads * v_sf_stride_h)
+        << "H256 V-scale pages must not overlap";
+  }
+
+  auto tensors_overlap = [](TensorView lhs, size_t lhs_element_bytes, TensorView rhs,
+                            size_t rhs_element_bytes) {
+    auto span_end = [](TensorView tensor, size_t element_bytes) {
+      auto strides = tensor.strides();
+      size_t max_element_offset = 0;
+      for (int i = 0; i < tensor.ndim(); ++i) {
+        if (tensor.size(i) > 0) {
+          max_element_offset += (tensor.size(i) - 1) * strides[i];
+        }
+      }
+      return reinterpret_cast<size_t>(tensor.data_ptr()) + (max_element_offset + 1) * element_bytes;
+    };
+    const size_t lhs_begin = reinterpret_cast<size_t>(lhs.data_ptr());
+    const size_t rhs_begin = reinterpret_cast<size_t>(rhs.data_ptr());
+    return lhs_begin < span_end(rhs, rhs_element_bytes) &&
+           rhs_begin < span_end(lhs, lhs_element_bytes);
+  };
+
+  const bool has_fused_q = q_input.has_value();
+  TVM_FFI_ICHECK_EQ(has_fused_q, q_output.has_value())
+      << "q_input and q_output must be provided together";
+  uint32_t num_q_heads = 0;
+  size_t q_in_stride_n = 0;
+  size_t q_in_stride_h = 0;
+  if (has_fused_q) {
+    TensorView q_in = q_input.value();
+    TensorView q_out = q_output.value();
+    CHECK_LAST_DIM_CONTIGUOUS(q_in);
+    CHECK_INPUT(q_out);
+    CHECK_DIM(3, q_in);
+    CHECK_DIM(3, q_out);
+    CHECK_DEVICE(q_in, append_key);
+    CHECK_DEVICE(q_out, append_key);
+    TVM_FFI_ICHECK(q_in.dtype() == append_key.dtype()) << "q_input must match append_key dtype";
+    TVM_FFI_ICHECK(q_out.dtype() == dl_float8_e4m3fn) << "q_output must be a float8_e4m3fn tensor";
+    TVM_FFI_ICHECK_GE(q_in.size(0), nnz);
+    TVM_FFI_ICHECK_GE(q_out.size(0), nnz);
+    TVM_FFI_ICHECK_EQ(q_in.size(1), q_out.size(1));
+    TVM_FFI_ICHECK_EQ(q_in.size(2), head_dim);
+    TVM_FFI_ICHECK_EQ(q_out.size(2), head_dim);
+    num_q_heads = q_in.size(1);
+    auto q_in_strides = q_in.strides();
+    q_in_stride_n = q_in_strides[0];
+    q_in_stride_h = q_in_strides[1];
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(q_in.data_ptr()) % 16, 0);
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(q_out.data_ptr()) % 16, 0);
+    for (int i = 0; i < q_in.ndim() - 1; ++i) {
+      TVM_FFI_ICHECK_EQ((q_in_strides[i] * 2) % 16, 0);
+    }
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, append_key, 2));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, append_value, 2));
+    TVM_FFI_ICHECK(
+        !tensors_overlap(q_out, 1, slot_mapping, slot_mapping.dtype() == dl_int32 ? 4 : 8));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, paged_k_cache, 1));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, paged_v_cache, 1));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, k_scale_cache, 1));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, v_scale_cache, 1));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, k_scale, 4));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, v_scale, 4));
+    TVM_FFI_ICHECK(!tensors_overlap(q_out, 1, q_in, 2));
+  }
+
+  // Source loads require 16-byte alignment; packed cache stores require 8 bytes.
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(append_key.data_ptr()) % 16, 0);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(append_value.data_ptr()) % 16, 0);
+  for (int i = 0; i < append_key.ndim() - 1; ++i) {
+    TVM_FFI_ICHECK_EQ((append_k_strides[i] * 2) % 16, 0);
+    TVM_FFI_ICHECK_EQ((append_v_strides[i] * 2) % 16, 0);
+  }
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(paged_k_cache.data_ptr()) % 8, 0);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(paged_v_cache.data_ptr()) % 8, 0);
+  for (int i = 0; i < paged_k_cache.ndim() - 1; ++i) {
+    TVM_FFI_ICHECK_EQ(k_strides[i] % 8, 0);
+    TVM_FFI_ICHECK_EQ(v_strides[i] % 8, 0);
+  }
+
+  const bool has_fused_context = context_dst_rows.has_value();
+  TVM_FFI_ICHECK_EQ(has_fused_context, context_k_output.has_value())
+      << "context_dst_rows, context_k_output, and context_v_output must be provided together";
+  TVM_FFI_ICHECK_EQ(has_fused_context, context_v_output.has_value())
+      << "context_dst_rows, context_k_output, and context_v_output must be provided together";
+  uint32_t context_num_rows = 0;
+  size_t context_k_stride_n = 0;
+  size_t context_k_stride_h = 0;
+  size_t context_v_stride_n = 0;
+  size_t context_v_stride_h = 0;
+  if (has_fused_context) {
+    TensorView context_rows = context_dst_rows.value();
+    TensorView context_k = context_k_output.value();
+    TensorView context_v = context_v_output.value();
+    CHECK_INPUT(context_rows);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(context_k);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(context_v);
+    CHECK_DIM(1, context_rows);
+    CHECK_DIM(3, context_k);
+    CHECK_DIM(3, context_v);
+    CHECK_DEVICE(context_rows, append_key);
+    CHECK_DEVICE(context_k, append_key);
+    CHECK_DEVICE(context_v, append_key);
+    TVM_FFI_ICHECK(context_rows.dtype() == slot_mapping.dtype())
+        << "context_dst_rows must match slot_mapping dtype";
+    TVM_FFI_ICHECK(context_k.dtype() == dl_float8_e4m3fn && context_v.dtype() == dl_float8_e4m3fn)
+        << "context K/V outputs must be float8_e4m3fn tensors";
+    TVM_FFI_ICHECK_EQ(context_rows.size(0), nnz);
+    TVM_FFI_ICHECK_EQ(context_k.size(0), context_v.size(0));
+    TVM_FFI_ICHECK_GT(context_k.size(0), 0);
+    TVM_FFI_ICHECK_EQ(context_k.size(1), num_heads);
+    TVM_FFI_ICHECK_EQ(context_v.size(1), num_heads);
+    TVM_FFI_ICHECK_EQ(context_k.size(2), head_dim);
+    TVM_FFI_ICHECK_EQ(context_v.size(2), head_dim);
+    TVM_FFI_ICHECK_EQ(head_dim, 256) << "fused context output is qualified only for H256";
+    auto context_k_strides = context_k.strides();
+    auto context_v_strides = context_v.strides();
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(context_k.data_ptr()) % 16, 0);
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<size_t>(context_v.data_ptr()) % 16, 0);
+    TVM_FFI_ICHECK_EQ(context_k_strides[0] % 16, 0);
+    TVM_FFI_ICHECK_EQ(context_k_strides[1] % 16, 0);
+    TVM_FFI_ICHECK_EQ(context_v_strides[0] % 16, 0);
+    TVM_FFI_ICHECK_EQ(context_v_strides[1] % 16, 0);
+    TVM_FFI_ICHECK_GE(context_k_strides[1], head_dim) << "context K heads must not overlap";
+    TVM_FFI_ICHECK_GE(context_v_strides[1], head_dim) << "context V heads must not overlap";
+    TVM_FFI_ICHECK_GE(context_k_strides[0], num_heads * context_k_strides[1])
+        << "context K rows must not overlap";
+    TVM_FFI_ICHECK_GE(context_v_strides[0], num_heads * context_v_strides[1])
+        << "context V rows must not overlap";
+    TVM_FFI_ICHECK(!tensors_overlap(context_k, 1, context_v, 1))
+        << "context K/V outputs must not overlap";
+    auto check_context_no_overlap = [&](TensorView context_output) {
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, append_key, 2));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, append_value, 2));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, slot_mapping,
+                                      slot_mapping.dtype() == dl_int32 ? 4 : 8));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, context_rows,
+                                      context_rows.dtype() == dl_int32 ? 4 : 8));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, paged_k_cache, 1));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, paged_v_cache, 1));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, k_scale_cache, 1));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, v_scale_cache, 1));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, k_scale, 4));
+      TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, v_scale, 4));
+      if (has_fused_q) {
+        TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, q_input.value(), 2));
+        TVM_FFI_ICHECK(!tensors_overlap(context_output, 1, q_output.value(), 1));
+      }
+    };
+    check_context_no_overlap(context_k);
+    check_context_no_overlap(context_v);
+    if (has_fused_q) {
+      TVM_FFI_ICHECK(!tensors_overlap(q_output.value(), 1, context_rows,
+                                      context_rows.dtype() == dl_int32 ? 4 : 8));
+    }
+    cudaStreamCaptureStatus capture_status;
+    TVM_FFI_ICHECK_EQ(cudaStreamIsCapturing(stream, &capture_status), cudaSuccess);
+    TVM_FFI_ICHECK_EQ(capture_status, cudaStreamCaptureStatusNone)
+        << "fused context output is not supported during CUDA graph capture";
+    context_num_rows = context_k.size(0);
+    context_k_stride_n = context_k_strides[0];
+    context_k_stride_h = context_k_strides[1];
+    context_v_stride_n = context_v_strides[0];
+    context_v_stride_h = context_v_strides[1];
+  }
+
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(append_key.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(slot_mapping.dtype(), id_type, [&] {
+      if (has_fused_context) {
+        std::vector<id_type> host_context_rows(nnz);
+        TVM_FFI_ICHECK_EQ(
+            cudaMemcpyAsync(host_context_rows.data(), context_dst_rows.value().data_ptr(),
+                            nnz * sizeof(id_type), cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        TVM_FFI_ICHECK_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        std::unordered_set<id_type> seen_rows;
+        for (id_type row : host_context_rows) {
+          if (row >= 0 && static_cast<size_t>(row) < context_num_rows) {
+            TVM_FFI_ICHECK(seen_rows.insert(row).second)
+                << "context_dst_rows must not contain duplicate valid rows";
+          }
+        }
+      }
       cudaError_t status = NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
           static_cast<c_type*>(append_key.data_ptr()),
           static_cast<c_type*>(append_value.data_ptr()),
           static_cast<id_type*>(slot_mapping.data_ptr()), nnz, num_heads, page_size,
           static_cast<uint32_t>(paged_k_cache.size(0)), packed_head_dim, append_k_stride_n,
           append_k_stride_h, append_v_stride_n, append_v_stride_h,
-          static_cast<uint8_t*>(paged_k_cache.data_ptr()),
+          has_fused_q ? static_cast<const c_type*>(q_input.value().data_ptr()) : nullptr,
+          has_fused_q ? static_cast<uint8_t*>(q_output.value().data_ptr()) : nullptr, num_q_heads,
+          q_in_stride_n, q_in_stride_h,
+          has_fused_context ? static_cast<id_type*>(context_dst_rows.value().data_ptr()) : nullptr,
+          has_fused_context ? static_cast<uint8_t*>(context_k_output.value().data_ptr()) : nullptr,
+          has_fused_context ? static_cast<uint8_t*>(context_v_output.value().data_ptr()) : nullptr,
+          context_num_rows, context_k_stride_n, context_k_stride_h, context_v_stride_n,
+          context_v_stride_h, static_cast<uint8_t*>(paged_k_cache.data_ptr()),
           static_cast<uint8_t*>(paged_v_cache.data_ptr()),
           static_cast<uint8_t*>(k_scale_cache.data_ptr()),
           static_cast<uint8_t*>(v_scale_cache.data_ptr()), k_stride_page, k_stride_n, k_stride_h,

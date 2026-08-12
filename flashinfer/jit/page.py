@@ -20,7 +20,7 @@ from .core import JitSpec, gen_jit_spec
 
 def gen_page_module() -> JitSpec:
     return gen_jit_spec(
-        "page",
+        "page_nvfp4_gemma4_fused_context_v13_vector_q",
         [
             jit_env.FLASHINFER_CSRC_DIR / "page.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_page_binding.cu",

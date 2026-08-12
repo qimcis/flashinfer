@@ -248,18 +248,107 @@ __device__ __forceinline__ uint8_t nvfp4_append_quantize_e2m1(float value) {
   return sign | code;
 }
 
+// Match PyTorch E4M3FN overflow and NaN semantics; native conversion saturates.
+__device__ __forceinline__ uint8_t nvfp4_fused_cast_e4m3_torch(float f) {
+  constexpr uint32_t kFp8Max = UINT32_C(1087) << 20;
+  constexpr uint32_t kDenormMask = UINT32_C(141) << 23;
+  uint32_t f_bits = __float_as_uint(f);
+  const uint32_t sign = f_bits & UINT32_C(0x80000000);
+  f_bits ^= sign;
+  uint8_t result;
+  if (f_bits >= kFp8Max) {
+    result = UINT8_C(0x7f);
+  } else if (f_bits < (UINT32_C(121) << 23)) {
+    f_bits = __float_as_uint(__uint_as_float(f_bits) + __uint_as_float(kDenormMask));
+    result = static_cast<uint8_t>(f_bits - kDenormMask);
+  } else {
+    const uint32_t mant_odd = (f_bits >> 20) & 1;
+    f_bits += (static_cast<uint32_t>(7 - 127) << 23) + UINT32_C(0x7FFFF);
+    f_bits += mant_odd;
+    result = static_cast<uint8_t>(f_bits >> 20);
+  }
+  return result | static_cast<uint8_t>(sign >> 24);
+}
+
+__device__ __forceinline__ uint16_t nvfp4_fused_cast_e4m3x2_torch(float even_value,
+                                                                  float odd_value) {
+  // Repair native overflow, NaN, and infinity to match PyTorch E4M3FN.
+  uint16_t pair;
+  uint8_t* bytes = reinterpret_cast<uint8_t*>(&pair);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;"
+               : "=h"(pair)
+               : "f"(even_value), "f"(odd_value));
+#else
+  bytes[0] = nvfp4_fused_cast_e4m3_torch(even_value);
+  bytes[1] = nvfp4_fused_cast_e4m3_torch(odd_value);
+  return pair;
+#endif
+  // Exactly 464 rounds to max finite; larger magnitudes use the scalar helper.
+  constexpr uint32_t kMaxFiniteTie = UINT32_C(0x43e80000);  // 464.0f
+  const uint32_t even_bits = __float_as_uint(even_value);
+  const uint32_t odd_bits = __float_as_uint(odd_value);
+  if ((even_bits & UINT32_C(0x7fffffff)) > kMaxFiniteTie) {
+    bytes[0] = nvfp4_fused_cast_e4m3_torch(even_value);
+  }
+  if ((odd_bits & UINT32_C(0x7fffffff)) > kMaxFiniteTie) {
+    bytes[1] = nvfp4_fused_cast_e4m3_torch(odd_value);
+  }
+  return pair;
+}
+
+// Context outputs use native E4M3FN conversion semantics.
+__device__ __forceinline__ uint16_t nvfp4_fused_cast_e4m3x2_context_native(float even_value,
+                                                                           float odd_value) {
+  uint16_t pair;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;"
+               : "=h"(pair)
+               : "f"(even_value), "f"(odd_value));
+#else
+  uint8_t* bytes = reinterpret_cast<uint8_t*>(&pair);
+  bytes[0] = nvfp4_fused_cast_e4m3_torch(even_value);
+  bytes[1] = nvfp4_fused_cast_e4m3_torch(odd_value);
+#endif
+  return pair;
+}
+
 template <typename DType>
 __device__ __forceinline__ void nvfp4_append_quantize_block(
     const DType* __restrict__ input, const float global_scale, const size_t input_base,
-    const uint32_t dim_base, uint8_t* __restrict__ packed_out, uint8_t* __restrict__ sf_out) {
+    const uint32_t dim_base, uint8_t* __restrict__ packed_out, uint8_t* __restrict__ sf_out,
+    uint8_t* __restrict__ context_fp8_out = nullptr) {
+  // Reuse each source load for quantization and context output.
+  static_assert(sizeof(DType) == 2, "NVFP4 append expects 16-bit activations");
   float values[16];
   float amax = 0.0f;
+  const DType* row = input + input_base + dim_base;
+  uint4 raw[2];
+  raw[0] = *reinterpret_cast<const uint4*>(row);
+  raw[1] = *reinterpret_cast<const uint4*>(row + 8);
 #pragma unroll
-  for (uint32_t i = 0; i < 16; ++i) {
-    const float value = nvfp4_append_to_float(input[input_base + dim_base + i]);
-    values[i] = value;
-    amax = fmaxf(amax, fabsf(value));
+  for (uint32_t part = 0; part < 2; ++part) {
+    const DType* lane = reinterpret_cast<const DType*>(&raw[part]);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      const float value = nvfp4_append_to_float(lane[i]);
+      values[part * 8 + i] = value;
+      amax = fmaxf(amax, fabsf(value));
+    }
   }
+
+  if (context_fp8_out != nullptr) {
+    uint4 context_word;
+    uint16_t* context_pairs = reinterpret_cast<uint16_t*>(&context_word);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      context_pairs[i] = nvfp4_fused_cast_e4m3x2_context_native(values[i * 2], values[i * 2 + 1]);
+    }
+    *reinterpret_cast<uint4*>(context_fp8_out) = context_word;
+  }
+
+  // Context rows remain valid independently of persistent cache slots.
+  if (packed_out == nullptr) return;
 
   float sf_value = 0.0f;
   if (amax > 0.0f && global_scale > 0.0f) {
@@ -273,12 +362,33 @@ __device__ __forceinline__ void nvfp4_append_quantize_block(
                                  ? (1.0f / (sf_rounded * global_scale))
                                  : 0.0f;
 
+  uint64_t packed_word = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#pragma unroll
+  for (uint32_t i = 0; i < 8; ++i) {
+    float even_value = values[i * 2] * output_scale;
+    float odd_value = values[i * 2 + 1] * output_scale;
+    even_value = (even_value == even_value) ? even_value : copysignf(0.0f, even_value);
+    odd_value = (odd_value == odd_value) ? odd_value : copysignf(0.0f, odd_value);
+    uint32_t pair;
+    asm("{\n\t"
+        ".reg .b8 pair_b8;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 pair_b8, %2, %1;\n\t"
+        "cvt.u32.u8 %0, pair_b8;\n\t"
+        "}"
+        : "=r"(pair)
+        : "f"(even_value), "f"(odd_value));
+    packed_word |= static_cast<uint64_t>(pair & 0xffu) << (8 * i);
+  }
+#else
 #pragma unroll
   for (uint32_t i = 0; i < 8; ++i) {
     const uint8_t lo = nvfp4_append_quantize_e2m1(values[i * 2] * output_scale);
     const uint8_t hi = nvfp4_append_quantize_e2m1(values[i * 2 + 1] * output_scale);
-    packed_out[i] = lo | (hi << 4);
+    packed_word |= static_cast<uint64_t>(lo | (hi << 4)) << (8 * i);
   }
+#endif
+  *reinterpret_cast<uint64_t*>(packed_out) = packed_word;
 }
 
 __device__ __forceinline__ bool nvfp4_append_is_positive_finite_scale(float scale) {
@@ -488,18 +598,195 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheKernel(
   }
 }
 
+// One CTA handles each token; lanes process K/V scale blocks and Q pairs.
+template <typename DType, typename IdType>
+__global__ void NVFP4QuantizeAppendFusedContextH256VectorQKernel(
+    const DType* __restrict__ append_key, const DType* __restrict__ append_value,
+    const IdType* __restrict__ slot_mapping, uint32_t num_heads, uint32_t page_size,
+    uint32_t max_num_pages, size_t append_k_stride_n, size_t append_k_stride_h,
+    size_t append_v_stride_n, size_t append_v_stride_h, const DType* __restrict__ q_input,
+    uint8_t* __restrict__ q_output, uint32_t num_q_heads, size_t q_in_stride_n,
+    size_t q_in_stride_h, const IdType* __restrict__ context_dst_rows,
+    uint8_t* __restrict__ context_k_output, uint8_t* __restrict__ context_v_output,
+    uint32_t context_num_rows, size_t context_k_stride_n, size_t context_k_stride_h,
+    size_t context_v_stride_n, size_t context_v_stride_h, uint8_t* __restrict__ paged_k_cache,
+    uint8_t* __restrict__ paged_v_cache, uint8_t* __restrict__ k_scale_cache,
+    uint8_t* __restrict__ v_scale_cache, size_t k_stride_page, size_t k_stride_n, size_t k_stride_h,
+    size_t v_stride_page, size_t v_stride_n, size_t v_stride_h, size_t k_sf_stride_page,
+    size_t k_sf_stride_n, size_t k_sf_stride_h, size_t v_sf_stride_page, size_t v_sf_stride_h,
+    const float* __restrict__ k_scale_ptr, const float* __restrict__ v_scale_ptr) {
+  constexpr uint32_t kHeadDim = 256;
+  constexpr uint32_t kScaleBlocks = kHeadDim / 16;
+  constexpr uint32_t kQPairsPerWork = 8;
+  const uint32_t token_idx = blockIdx.x;
+  const uint32_t work_idx = threadIdx.x;
+  const uint32_t kv_work = num_heads * 2 * kScaleBlocks;
+  const float k_scale = __ldg(k_scale_ptr);
+  const float v_scale = __ldg(v_scale_ptr);
+  if (!(nvfp4_append_is_positive_finite_scale(k_scale) &&
+        nvfp4_append_is_positive_finite_scale(v_scale))) {
+    asm volatile("trap;");
+    return;
+  }
+
+  if (work_idx < kv_work) {
+    uint32_t logical = work_idx;
+    const uint32_t scale_block = logical % kScaleBlocks;
+    logical /= kScaleBlocks;
+    const bool is_value = logical & 1;
+    const uint32_t head_idx = logical >> 1;
+    const IdType slot = slot_mapping[token_idx];
+    const IdType context_row = context_dst_rows[token_idx];
+    const bool persistent_valid =
+        slot >= 0 && static_cast<size_t>(slot) < static_cast<size_t>(max_num_pages) * page_size;
+    const bool context_valid =
+        context_row >= 0 && static_cast<size_t>(context_row) < context_num_rows;
+    if (persistent_valid || context_valid) {
+      const uint32_t dim_base = scale_block * 16;
+      const size_t input_base =
+          static_cast<size_t>(token_idx) * (is_value ? append_v_stride_n : append_k_stride_n) +
+          head_idx * (is_value ? append_v_stride_h : append_k_stride_h);
+      uint8_t* packed_out = nullptr;
+      uint8_t* sf_out = nullptr;
+      if (persistent_valid) {
+        const size_t page_idx = static_cast<size_t>(slot) / page_size;
+        const size_t entry_idx = static_cast<size_t>(slot) % page_size;
+        if (is_value) {
+          packed_out = paged_v_cache + page_idx * v_stride_page + entry_idx * v_stride_n +
+                       head_idx * v_stride_h + scale_block * 8;
+          sf_out = v_scale_cache + page_idx * v_sf_stride_page + head_idx * v_sf_stride_h +
+                   (entry_idx / 4) * (4 * kScaleBlocks) + entry_idx % 4 + scale_block * 4;
+        } else {
+          packed_out = paged_k_cache + page_idx * k_stride_page + entry_idx * k_stride_n +
+                       head_idx * k_stride_h + scale_block * 8;
+          sf_out = k_scale_cache + page_idx * k_sf_stride_page + entry_idx * k_sf_stride_n +
+                   head_idx * k_sf_stride_h + scale_block;
+        }
+      }
+      uint8_t* context_out = nullptr;
+      if (context_valid) {
+        context_out = (is_value ? context_v_output : context_k_output) +
+                      static_cast<size_t>(context_row) *
+                          (is_value ? context_v_stride_n : context_k_stride_n) +
+                      head_idx * (is_value ? context_v_stride_h : context_k_stride_h) + dim_base;
+      }
+      nvfp4_append_quantize_block(is_value ? append_value : append_key,
+                                  is_value ? v_scale : k_scale, input_base, dim_base, packed_out,
+                                  sf_out, context_out);
+    }
+  }
+
+  if (q_input == nullptr) return;
+  constexpr uint32_t kQPairsPerHead = kHeadDim / 2;
+  constexpr uint32_t kQWorkPerHead = kQPairsPerHead / kQPairsPerWork;
+  const uint32_t q_work = num_q_heads * kQWorkPerHead;
+  if (work_idx >= q_work) return;
+  const uint32_t q_head_idx = work_idx / kQWorkPerHead;
+  const uint32_t dim_pair_base = (work_idx % kQWorkPerHead) * kQPairsPerWork;
+  const size_t q_in_base = static_cast<size_t>(token_idx) * q_in_stride_n +
+                           q_head_idx * q_in_stride_h + dim_pair_base * 2;
+  const size_t q_out_base =
+      (static_cast<size_t>(token_idx) * num_q_heads + q_head_idx) * kQPairsPerHead + dim_pair_base;
+  static_assert(sizeof(DType) == 2, "fused H256 Q expects 16-bit activations");
+  const DType* __restrict__ q_in = q_input + q_in_base;
+  uint4 q_raw[2];
+  q_raw[0] = *reinterpret_cast<const uint4*>(q_in);
+  q_raw[1] = *reinterpret_cast<const uint4*>(q_in + 8);
+  uint4 q_word;
+  uint16_t* __restrict__ q_pairs = reinterpret_cast<uint16_t*>(&q_word);
+#pragma unroll
+  for (uint32_t part = 0; part < 2; ++part) {
+    const DType* __restrict__ lane = reinterpret_cast<const DType*>(&q_raw[part]);
+#pragma unroll
+    for (uint32_t pair = 0; pair < 4; ++pair) {
+      q_pairs[part * 4 + pair] = nvfp4_fused_cast_e4m3x2_context_native(
+          nvfp4_append_to_float(lane[pair * 2]), nvfp4_append_to_float(lane[pair * 2 + 1]));
+    }
+  }
+  *reinterpret_cast<uint4*>(q_output + q_out_base * sizeof(uint16_t)) = q_word;
+}
+
+template <typename DType, typename IdType>
+cudaError_t NVFP4QuantizeAppendFusedContextH256(
+    DType* append_key, DType* append_value, IdType* slot_mapping, uint32_t nnz, uint32_t num_heads,
+    uint32_t page_size, uint32_t max_num_pages, size_t append_k_stride_n, size_t append_k_stride_h,
+    size_t append_v_stride_n, size_t append_v_stride_h, const DType* q_input, uint8_t* q_output,
+    uint32_t num_q_heads, size_t q_in_stride_n, size_t q_in_stride_h, IdType* context_dst_rows,
+    uint8_t* context_k_output, uint8_t* context_v_output, uint32_t context_num_rows,
+    size_t context_k_stride_n, size_t context_k_stride_h, size_t context_v_stride_n,
+    size_t context_v_stride_h, uint8_t* paged_k_cache, uint8_t* paged_v_cache,
+    uint8_t* k_scale_cache, uint8_t* v_scale_cache, size_t k_stride_page, size_t k_stride_n,
+    size_t k_stride_h, size_t v_stride_page, size_t v_stride_n, size_t v_stride_h,
+    size_t k_sf_stride_page, size_t k_sf_stride_n, size_t k_sf_stride_h, size_t v_sf_stride_page,
+    size_t v_sf_stride_h, float* k_scale, float* v_scale, cudaStream_t stream) {
+  constexpr uint32_t kScaleBlocks = 256 / 16;
+  constexpr uint32_t kQPairsPerWork = 8;
+  const uint32_t kv_work = num_heads * 2 * kScaleBlocks;
+  const uint32_t q_pairs = q_input != nullptr ? num_q_heads * (256 / 2) : 0;
+  const uint32_t q_work = (q_pairs + kQPairsPerWork - 1) / kQPairsPerWork;
+  const uint32_t active_threads = kv_work > q_work ? kv_work : q_work;
+  const uint32_t num_threads = ((active_threads + 31) / 32) * 32;
+  if (num_threads > 1024) return cudaErrorInvalidValue;
+  dim3 nblks(nnz);
+  dim3 nthrs(num_threads);
+  auto kernel = NVFP4QuantizeAppendFusedContextH256VectorQKernel<DType, IdType>;
+  void* args[] = {(void*)&append_key,
+                  (void*)&append_value,
+                  (void*)&slot_mapping,
+                  (void*)&num_heads,
+                  (void*)&page_size,
+                  (void*)&max_num_pages,
+                  (void*)&append_k_stride_n,
+                  (void*)&append_k_stride_h,
+                  (void*)&append_v_stride_n,
+                  (void*)&append_v_stride_h,
+                  (void*)&q_input,
+                  (void*)&q_output,
+                  (void*)&num_q_heads,
+                  (void*)&q_in_stride_n,
+                  (void*)&q_in_stride_h,
+                  (void*)&context_dst_rows,
+                  (void*)&context_k_output,
+                  (void*)&context_v_output,
+                  (void*)&context_num_rows,
+                  (void*)&context_k_stride_n,
+                  (void*)&context_k_stride_h,
+                  (void*)&context_v_stride_n,
+                  (void*)&context_v_stride_h,
+                  (void*)&paged_k_cache,
+                  (void*)&paged_v_cache,
+                  (void*)&k_scale_cache,
+                  (void*)&v_scale_cache,
+                  (void*)&k_stride_page,
+                  (void*)&k_stride_n,
+                  (void*)&k_stride_h,
+                  (void*)&v_stride_page,
+                  (void*)&v_stride_n,
+                  (void*)&v_stride_h,
+                  (void*)&k_sf_stride_page,
+                  (void*)&k_sf_stride_n,
+                  (void*)&k_sf_stride_h,
+                  (void*)&v_sf_stride_page,
+                  (void*)&v_sf_stride_h,
+                  (void*)&k_scale,
+                  (void*)&v_scale};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  return cudaSuccess;
+}
+
 template <uint32_t HEAD_DIM, typename DType, typename IdType>
 __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
     const DType* __restrict__ append_key, const DType* __restrict__ append_value,
     const IdType* __restrict__ slot_mapping, uint32_t nnz, uint32_t num_heads, uint32_t page_size,
     uint32_t max_num_pages, size_t append_k_stride_n, size_t append_k_stride_h,
-    size_t append_v_stride_n, size_t append_v_stride_h, uint8_t* __restrict__ paged_k_cache,
-    uint8_t* __restrict__ paged_v_cache, uint8_t* __restrict__ k_scale_cache,
-    uint8_t* __restrict__ v_scale_cache, size_t k_stride_page, size_t k_stride_n, size_t k_stride_h,
-    size_t v_stride_page, size_t v_stride_n, size_t v_stride_h, size_t k_sf_stride_page,
-    size_t k_sf_stride_n, size_t k_sf_stride_h, size_t v_sf_stride_page, size_t v_sf_stride_n,
-    size_t v_sf_stride_h, const float* __restrict__ k_scale_ptr,
-    const float* __restrict__ v_scale_ptr) {
+    size_t append_v_stride_n, size_t append_v_stride_h, const DType* __restrict__ q_input,
+    uint8_t* __restrict__ q_output, uint32_t num_q_heads, size_t q_in_stride_n,
+    size_t q_in_stride_h, uint8_t* __restrict__ paged_k_cache, uint8_t* __restrict__ paged_v_cache,
+    uint8_t* __restrict__ k_scale_cache, uint8_t* __restrict__ v_scale_cache, size_t k_stride_page,
+    size_t k_stride_n, size_t k_stride_h, size_t v_stride_page, size_t v_stride_n,
+    size_t v_stride_h, size_t k_sf_stride_page, size_t k_sf_stride_n, size_t k_sf_stride_h,
+    size_t v_sf_stride_page, size_t v_sf_stride_n, size_t v_sf_stride_h,
+    const float* __restrict__ k_scale_ptr, const float* __restrict__ v_scale_ptr) {
   constexpr uint32_t SF_VEC_SIZE = 16;
   constexpr uint32_t PACKED_PER_SF = SF_VEC_SIZE / 2;
   constexpr uint32_t NUM_SF_BLOCKS = HEAD_DIM / SF_VEC_SIZE;
@@ -508,6 +795,23 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
   const uint32_t token_idx = blockIdx.x;
   const uint32_t head_idx = blockIdx.y;
   if (token_idx >= nnz) return;
+
+  if (head_idx >= num_heads) {
+    // Q lanes convert all rows, including rows with negative cache slots.
+    const uint32_t q_head_idx = head_idx - num_heads;
+    const size_t q_in_base =
+        static_cast<size_t>(token_idx) * q_in_stride_n + q_head_idx * q_in_stride_h;
+    uint8_t* q_out = q_output + (static_cast<size_t>(token_idx) * num_q_heads + q_head_idx) *
+                                    static_cast<size_t>(HEAD_DIM);
+    uint16_t* q_out_pairs = reinterpret_cast<uint16_t*>(q_out);
+    for (uint32_t pair_idx = threadIdx.x; pair_idx < HEAD_DIM / 2; pair_idx += blockDim.x) {
+      const uint32_t dim_idx = pair_idx * 2;
+      q_out_pairs[pair_idx] =
+          nvfp4_fused_cast_e4m3x2_torch(nvfp4_append_to_float(q_input[q_in_base + dim_idx]),
+                                        nvfp4_append_to_float(q_input[q_in_base + dim_idx + 1]));
+    }
+    return;
+  }
 
   const float k_scale = __ldg(k_scale_ptr);
   const float v_scale = __ldg(v_scale_ptr);
@@ -535,8 +839,14 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
       paged_v_cache + page_idx * v_stride_page + entry_idx * v_stride_n + head_idx * v_stride_h;
   uint8_t* k_sf_out = k_scale_cache + page_idx * k_sf_stride_page + entry_idx * k_sf_stride_n +
                       head_idx * k_sf_stride_h;
-  uint8_t* v_sf_out = v_scale_cache + page_idx * v_sf_stride_page + entry_idx * v_sf_stride_n +
-                      head_idx * v_sf_stride_h;
+  uint8_t* v_sf_out;
+  if constexpr (HEAD_DIM == 256) {
+    v_sf_out = v_scale_cache + page_idx * v_sf_stride_page + head_idx * v_sf_stride_h +
+               (entry_idx / 4) * (4 * NUM_SF_BLOCKS) + entry_idx % 4;
+  } else {
+    v_sf_out = v_scale_cache + page_idx * v_sf_stride_page + entry_idx * v_sf_stride_n +
+               head_idx * v_sf_stride_h;
+  }
 
   for (uint32_t sf_idx = threadIdx.x; sf_idx < NUM_SF_BLOCKS * 2; sf_idx += blockDim.x) {
     const bool is_v = sf_idx >= NUM_SF_BLOCKS;
@@ -544,8 +854,12 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
     const uint32_t dim_base = block_idx * SF_VEC_SIZE;
     const uint32_t packed_base = block_idx * PACKED_PER_SF;
     if (is_v) {
+      uint8_t* v_sf_block_out = v_sf_out + block_idx;
+      if constexpr (HEAD_DIM == 256) {
+        v_sf_block_out = v_sf_out + block_idx * 4;
+      }
       nvfp4_append_quantize_block(append_value, v_scale, append_v_base, dim_base,
-                                  v_out + packed_base, v_sf_out + block_idx);
+                                  v_out + packed_base, v_sf_block_out);
     } else {
       nvfp4_append_quantize_block(append_key, k_scale, append_k_base, dim_base, k_out + packed_base,
                                   k_sf_out + block_idx);
@@ -593,6 +907,10 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
     DType* append_key, DType* append_value, IdType* slot_mapping, uint32_t nnz, uint32_t num_heads,
     uint32_t page_size, uint32_t max_num_pages, uint32_t packed_head_dim, size_t append_k_stride_n,
     size_t append_k_stride_h, size_t append_v_stride_n, size_t append_v_stride_h,
+    const DType* q_input, uint8_t* q_output, uint32_t num_q_heads, size_t q_in_stride_n,
+    size_t q_in_stride_h, IdType* context_dst_rows, uint8_t* context_k_output,
+    uint8_t* context_v_output, uint32_t context_num_rows, size_t context_k_stride_n,
+    size_t context_k_stride_h, size_t context_v_stride_n, size_t context_v_stride_h,
     uint8_t* paged_k_cache, uint8_t* paged_v_cache, uint8_t* k_scale_cache, uint8_t* v_scale_cache,
     size_t k_stride_page, size_t k_stride_n, size_t k_stride_h, size_t v_stride_page,
     size_t v_stride_n, size_t v_stride_h, size_t k_sf_stride_page, size_t k_sf_stride_n,
@@ -602,42 +920,42 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
     return cudaSuccess;
   }
   const uint32_t head_dim = packed_head_dim * 2;
+  if (head_dim == 256 && context_dst_rows != nullptr) {
+    return NVFP4QuantizeAppendFusedContextH256(
+        append_key, append_value, slot_mapping, nnz, num_heads, page_size, max_num_pages,
+        append_k_stride_n, append_k_stride_h, append_v_stride_n, append_v_stride_h, q_input,
+        q_output, num_q_heads, q_in_stride_n, q_in_stride_h, context_dst_rows, context_k_output,
+        context_v_output, context_num_rows, context_k_stride_n, context_k_stride_h,
+        context_v_stride_n, context_v_stride_h, paged_k_cache, paged_v_cache, k_scale_cache,
+        v_scale_cache, k_stride_page, k_stride_n, k_stride_h, v_stride_page, v_stride_n, v_stride_h,
+        k_sf_stride_page, k_sf_stride_n, k_sf_stride_h, v_sf_stride_page, v_sf_stride_h, k_scale,
+        v_scale, stream);
+  }
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t active_threads = (HEAD_DIM / 16) * 2;
     constexpr uint32_t num_threads =
         active_threads < 32 ? 32 : (active_threads > 128 ? 128 : active_threads);
-    dim3 nblks(nnz, num_heads);
+    const uint32_t num_head_blocks = num_heads + (q_input != nullptr ? num_q_heads : 0);
+    dim3 nblks(nnz, num_head_blocks);
     dim3 nthrs(num_threads);
     auto kernel = NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel<HEAD_DIM, DType, IdType>;
-    void* args[] = {(void*)&append_key,
-                    (void*)&append_value,
-                    (void*)&slot_mapping,
-                    (void*)&nnz,
-                    (void*)&num_heads,
-                    (void*)&page_size,
-                    (void*)&max_num_pages,
-                    (void*)&append_k_stride_n,
-                    (void*)&append_k_stride_h,
-                    (void*)&append_v_stride_n,
-                    (void*)&append_v_stride_h,
-                    (void*)&paged_k_cache,
-                    (void*)&paged_v_cache,
-                    (void*)&k_scale_cache,
-                    (void*)&v_scale_cache,
-                    (void*)&k_stride_page,
-                    (void*)&k_stride_n,
-                    (void*)&k_stride_h,
-                    (void*)&v_stride_page,
-                    (void*)&v_stride_n,
-                    (void*)&v_stride_h,
-                    (void*)&k_sf_stride_page,
-                    (void*)&k_sf_stride_n,
-                    (void*)&k_sf_stride_h,
-                    (void*)&v_sf_stride_page,
-                    (void*)&v_sf_stride_n,
-                    (void*)&v_sf_stride_h,
-                    (void*)&k_scale,
-                    (void*)&v_scale};
+    void* args[] = {(void*)&append_key,        (void*)&append_value,
+                    (void*)&slot_mapping,      (void*)&nnz,
+                    (void*)&num_heads,         (void*)&page_size,
+                    (void*)&max_num_pages,     (void*)&append_k_stride_n,
+                    (void*)&append_k_stride_h, (void*)&append_v_stride_n,
+                    (void*)&append_v_stride_h, (void*)&q_input,
+                    (void*)&q_output,          (void*)&num_q_heads,
+                    (void*)&q_in_stride_n,     (void*)&q_in_stride_h,
+                    (void*)&paged_k_cache,     (void*)&paged_v_cache,
+                    (void*)&k_scale_cache,     (void*)&v_scale_cache,
+                    (void*)&k_stride_page,     (void*)&k_stride_n,
+                    (void*)&k_stride_h,        (void*)&v_stride_page,
+                    (void*)&v_stride_n,        (void*)&v_stride_h,
+                    (void*)&k_sf_stride_page,  (void*)&k_sf_stride_n,
+                    (void*)&k_sf_stride_h,     (void*)&v_sf_stride_page,
+                    (void*)&v_sf_stride_n,     (void*)&v_sf_stride_h,
+                    (void*)&k_scale,           (void*)&v_scale};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;

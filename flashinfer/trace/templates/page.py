@@ -14,6 +14,7 @@
 
 """TraceTemplates for paged-KV cache append operations."""
 
+import copy
 import math
 from typing import Any, cast
 
@@ -389,13 +390,15 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init(
     page_size: int = 16,
     num_pages: int = 4,
     one: int = 1,
+    num_q_heads: int = 0,
     device: str = "cuda",
     seed: int = 0,
+    kv_layout: str = "NHD",
 ):
     """Build inputs for ``flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping``."""
     if head_dim % 16 != 0:
         raise ValueError("head_dim must be divisible by 16 for NVFP4 scales")
-    del one
+    del one, num_q_heads
     torch.manual_seed(seed)
     num_pages = max(num_pages, math.ceil(max(nnz_kv, 1) / page_size))
     append_key = torch.randn(
@@ -403,7 +406,7 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init(
     )
     append_value = torch.randn_like(append_key)
     packed_shape, scale_shape = _nvfp4_paged_cache_shapes(
-        num_pages, page_size, num_kv_heads, head_dim, "NHD"
+        num_pages, page_size, num_kv_heads, head_dim, kv_layout
     )
     k_cache = torch.zeros(packed_shape, dtype=torch.uint8, device=device)
     v_cache = torch.zeros_like(k_cache)
@@ -418,6 +421,7 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init(
         "kv_cache_sf": (k_scale_cache, v_scale_cache),
         "k_scale": torch.ones(1, dtype=torch.float32, device=device),
         "v_scale": torch.ones(1, dtype=torch.float32, device=device),
+        "kv_layout": kv_layout,
     }
 
 
@@ -427,7 +431,7 @@ cast(
 )._trace_init_dependencies = (_nvfp4_paged_cache_shapes,)
 
 
-nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_nhd_trace = TraceTemplate(
     op_type="page_append",
     name_prefix="nvfp4_quantize_append_paged_kv_cache_with_slot_mapping",
     description=(
@@ -440,6 +444,7 @@ nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
         "head_dim": Const(abbrev="d"),
         "packed_head_dim": Const(abbrev="pd"),
         "scale_dim": Const(abbrev="sd"),
+        "num_q_heads": Var(),
         "num_pages": Var(),
         "page_size": Const(abbrev="ps"),
         "one": Const(abbrev=""),
@@ -474,6 +479,12 @@ nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
         ),
         "k_scale": Tensor(["one"], dtype="float32"),
         "v_scale": Tensor(["one"], dtype="float32"),
+        "q_input": Tensor(["nnz_kv", "num_q_heads", "head_dim"], optional=True),
+        "q_output": Tensor(
+            ["nnz_kv", "num_q_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            optional=True,
+        ),
     },
     outputs={
         "paged_k_cache": Tensor(
@@ -504,6 +515,12 @@ nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
             tuple_idx=1,
             description="Updated V scale cache (in-place).",
         ),
+        "q_output": Tensor(
+            ["nnz_kv", "num_q_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            optional=True,
+            description="Updated fused Q output.",
+        ),
     },
     constraints=[
         "one == 1",
@@ -513,6 +530,174 @@ nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
     tags=["status:verified"],
     init=_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init,
 )
+
+
+def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_init(**kwargs):
+    kwargs["kv_layout"] = "HND"
+    return _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init(**kwargs)
+
+
+cast(
+    Any,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_init,
+)._trace_init_dependencies = (
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init,
+    _nvfp4_paged_cache_shapes,
+)
+
+
+def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_init(
+    *,
+    nnz_kv: int,
+    num_kv_heads: int = 8,
+    head_dim: int = 256,
+    page_size: int = 16,
+    context_num_rows: int = 1,
+    device: str = "cuda",
+    **kwargs,
+):
+    if head_dim != 256:
+        raise ValueError("fused context output requires head_dim 256")
+    if context_num_rows <= 0:
+        raise ValueError("context_num_rows must be positive")
+    if context_num_rows < nnz_kv:
+        raise ValueError("context_num_rows must cover every context destination")
+    if page_size % 4 != 0:
+        raise ValueError("page_size must be divisible by 4 for H256 context output")
+    inputs = _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_init(
+        nnz_kv=nnz_kv,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        **kwargs,
+    )
+    inputs.update(
+        context_dst_rows=torch.arange(nnz_kv, dtype=torch.int32, device=device),
+        context_k_output=torch.zeros(
+            context_num_rows,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        context_v_output=torch.zeros(
+            context_num_rows,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+    )
+    return inputs
+
+
+cast(
+    Any,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_init,
+)._trace_init_dependencies = (
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_init,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init,
+    _nvfp4_paged_cache_shapes,
+)
+
+
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace = copy.deepcopy(
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_nhd_trace
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace.name_prefix = (
+    "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd"
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace.init = (
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_init
+)
+for _descriptor_group in (
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace.inputs,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace.outputs,
+):
+    for _name, _tail_axis in (
+        ("paged_k_cache", "packed_head_dim"),
+        ("paged_v_cache", "packed_head_dim"),
+        ("k_scale_cache", "scale_dim"),
+        ("v_scale_cache", "scale_dim"),
+    ):
+        _descriptor_group[_name].dim_names = [
+            "num_pages",
+            "num_kv_heads",
+            "page_size",
+            _tail_axis,
+        ]
+
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace = (
+    copy.deepcopy(_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace)
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.name_prefix = "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context"
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.init = (
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_init
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.axes[
+    "context_num_rows"
+] = Var()
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.inputs.update(
+    {
+        "context_dst_rows": Tensor(["nnz_kv"], dtype="int32"),
+        "context_k_output": Tensor(
+            ["context_num_rows", "num_kv_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+        ),
+        "context_v_output": Tensor(
+            ["context_num_rows", "num_kv_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+        ),
+    }
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.outputs.update(
+    {
+        "context_k_output": Tensor(
+            ["context_num_rows", "num_kv_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            description="Updated fused context K output.",
+        ),
+        "context_v_output": Tensor(
+            ["context_num_rows", "num_kv_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            description="Updated fused context V output.",
+        ),
+    }
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.constraints.append(
+    "head_dim == 256"
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.constraints.append(
+    "context_num_rows >= nnz_kv"
+)
+_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace.constraints.extend(
+    ["context_num_rows > 0", "page_size % 4 == 0"]
+)
+
+
+def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace(**kwargs):
+    kv_layout = kwargs.get("kv_layout", "NHD")
+    has_context = "context_num_rows" in kwargs or any(
+        kwargs.get(name) is not None
+        for name in ("context_dst_rows", "context_k_output", "context_v_output")
+    )
+    if kv_layout == "NHD":
+        if has_context:
+            raise ValueError("fused context output requires HND KV layout")
+        return _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_nhd_trace
+    if kv_layout == "HND":
+        if has_context:
+            return _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace
+        return _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace
+    raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+
+nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace.templates = [  # type: ignore[attr-defined]
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_nhd_trace,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_trace,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_hnd_context_trace,
+]
 
 
 @torch.no_grad()

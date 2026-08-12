@@ -202,6 +202,9 @@ def _fake_nvfp4_quantize_append_paged_kv_cache_kernel(
         "paged_v_cache",
         "k_scale_cache",
         "v_scale_cache",
+        "q_output",
+        "context_k_output",
+        "context_v_output",
     ),
 )
 def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
@@ -215,8 +218,12 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     layout: int,
+    q_input: Optional[torch.Tensor],
+    q_output: Optional[torch.Tensor],
+    context_dst_rows: Optional[torch.Tensor],
+    context_k_output: Optional[torch.Tensor],
+    context_v_output: Optional[torch.Tensor],
 ) -> None:
-    slot_mapping = slot_mapping.contiguous()
     get_page_module().nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         append_key,
         append_value,
@@ -227,6 +234,11 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
         v_scale_cache,
         k_scale,
         v_scale,
+        q_input,
+        q_output,
+        context_dst_rows,
+        context_k_output,
+        context_v_output,
         layout,
     )
 
@@ -243,6 +255,11 @@ def _fake_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     layout: int,
+    q_input: Optional[torch.Tensor],
+    q_output: Optional[torch.Tensor],
+    context_dst_rows: Optional[torch.Tensor],
+    context_k_output: Optional[torch.Tensor],
+    context_v_output: Optional[torch.Tensor],
 ) -> None:
     pass
 
@@ -529,6 +546,35 @@ def append_paged_kv_cache(
     )
 
 
+def _check_nvfp4_append_vector_alignment(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+) -> None:
+    for name, tensor in (("append_key", append_key), ("append_value", append_value)):
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have a contiguous last dimension")
+        if tensor.shape[-1] % 16 != 0:
+            raise ValueError(f"{name} head_dim must be a multiple of 16")
+        element_size = tensor.element_size()
+        if (tensor.data_ptr() % 16) != 0 or any(
+            (stride * element_size) % 16 != 0 for stride in tensor.stride()[:-1]
+        ):
+            raise ValueError(f"{name} rows must be 16-byte aligned")
+
+    for name, tensor in (
+        ("paged_k_cache", paged_k_cache),
+        ("paged_v_cache", paged_v_cache),
+    ):
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have a contiguous last dimension")
+        if (tensor.data_ptr() % 8) != 0 or any(
+            (stride * tensor.element_size()) % 8 != 0 for stride in tensor.stride()[:-1]
+        ):
+            raise ValueError(f"{name} must be 8-byte aligned")
+
+
 @flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_trace)
 def nvfp4_quantize_append_paged_kv_cache(
     append_key: torch.Tensor,
@@ -578,7 +624,8 @@ def nvfp4_quantize_append_paged_kv_cache(
     kv_cache_sf : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         Caller-owned FP8 E4M3 scale cache with the same tuple or stacked cache
         format as ``paged_kv_cache``, replacing ``head_dim // 2`` with
-        ``head_dim // 16``.
+        ``head_dim // 16``. H256 is not supported by this legacy batch/position
+        API; use the slot-mapping HND API for interleaved V scales.
     kv_indices : torch.Tensor
         The page indices of the paged KV cache, shape ``[kv_indptr[-1]]``.
     kv_indptr : torch.Tensor
@@ -616,6 +663,13 @@ def nvfp4_quantize_append_paged_kv_cache(
         )
     paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
     k_scale_cache, v_scale_cache = _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+    if append_key.shape[-1] == 256:
+        raise ValueError(
+            "H256 NVFP4 append is supported only by the slot-mapping HND API"
+        )
+    _check_nvfp4_append_vector_alignment(
+        append_key, append_value, paged_k_cache, paged_v_cache
+    )
     if paged_k_cache.dtype != torch.uint8 or paged_v_cache.dtype != torch.uint8:
         raise ValueError("NVFP4 paged K/V cache tensors must have dtype torch.uint8")
     if (
@@ -749,6 +803,11 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     k_scale: Union[float, torch.Tensor],
     v_scale: Union[float, torch.Tensor],
     kv_layout: str = "NHD",
+    q_input: Optional[torch.Tensor] = None,
+    q_output: Optional[torch.Tensor] = None,
+    context_dst_rows: Optional[torch.Tensor] = None,
+    context_k_output: Optional[torch.Tensor] = None,
+    context_v_output: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Quantize and write K/V rows into an NVFP4 paged KV cache by slot mapping.
 
@@ -811,6 +870,12 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         raise ValueError(
             f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
         )
+    if not slot_mapping.is_contiguous():
+        if _is_stream_capturing_on_device(slot_mapping.device):
+            raise ValueError(
+                "slot_mapping must be contiguous during CUDA graph capture"
+            )
+        slot_mapping = slot_mapping.contiguous()
     if (
         append_key.shape[0] < slot_mapping.shape[0]
         or append_value.shape[0] < slot_mapping.shape[0]
@@ -818,9 +883,28 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         raise ValueError(
             "append_key and append_value must have at least slot_mapping.shape[0] rows"
         )
-
     paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
     k_scale_cache, v_scale_cache = _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+    if append_key.shape[-1] == 256:
+        if kv_layout != "HND":
+            raise ValueError(
+                "H256 NVFP4 append requires HND layout for the interleaved V-scale cache"
+            )
+        page_size = paged_k_cache.shape[2]
+        if page_size % 4 != 0:
+            raise ValueError(
+                "H256 NVFP4 append requires page_size divisible by 4 for interleaved V scales"
+            )
+        scale_dim = append_key.shape[-1] // 16
+        v_scale_strides = v_scale_cache.stride()
+        if (
+            v_scale_strides[2] != scale_dim
+            or v_scale_strides[1] < page_size * scale_dim
+            or v_scale_strides[0] < v_scale_cache.shape[1] * v_scale_strides[1]
+        ):
+            raise ValueError(
+                "H256 NVFP4 append requires dense, non-overlapping HND V-scale storage"
+            )
     if paged_k_cache.dtype != torch.uint8 or paged_v_cache.dtype != torch.uint8:
         raise ValueError("NVFP4 paged K/V cache tensors must have dtype torch.uint8")
     if (
@@ -836,6 +920,190 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         device=append_key.device,
     )
 
+    if (q_input is None) != (q_output is None):
+        raise ValueError("q_input and q_output must be provided together")
+    if q_input is not None:
+        if q_input.dtype != append_key.dtype:
+            raise ValueError(
+                f"q_input must match append_key dtype, got {q_input.dtype}"
+            )
+        if q_output.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"q_output must be float8_e4m3fn, got {q_output.dtype}")
+        if q_input.dim() != 3 or q_output.dim() != 3:
+            raise ValueError("q_input and q_output must be 3-D [rows, heads, dim]")
+        if q_input.stride(-1) != 1:
+            raise ValueError("q_input must have a contiguous last dimension")
+        if not q_output.is_contiguous():
+            raise ValueError("q_output must be contiguous")
+        if (
+            q_input.shape[0] < slot_mapping.shape[0]
+            or q_output.shape[0] < slot_mapping.shape[0]
+        ):
+            raise ValueError(
+                "q_input and q_output must have at least slot_mapping.shape[0] rows"
+            )
+        if (
+            q_input.shape[1] != q_output.shape[1]
+            or q_input.shape[2] != q_output.shape[2]
+        ):
+            raise ValueError("q_input and q_output must have matching head/dim shapes")
+        if q_input.shape[2] != append_key.shape[2]:
+            raise ValueError(
+                "fused Q cast requires q head_dim to match the KV head_dim"
+            )
+        if (q_input.data_ptr() % 16) != 0 or any(
+            (stride * q_input.element_size()) % 16 != 0
+            for stride in q_input.stride()[:-1]
+        ):
+            raise ValueError("q_input rows must be 16-byte aligned")
+        if (q_output.data_ptr() % 16) != 0:
+            raise ValueError("q_output must be 16-byte aligned")
+
+        def _q_byte_span(tensor):
+            max_element = sum(
+                (size - 1) * stride
+                for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            )
+            start = tensor.data_ptr()
+            return start, start + (max_element + 1) * tensor.element_size()
+
+        q_output_start, q_output_end = _q_byte_span(q_output)
+        for other_name, other in (
+            ("append_key", append_key),
+            ("append_value", append_value),
+            ("slot_mapping", slot_mapping),
+            ("paged_k_cache", paged_k_cache),
+            ("paged_v_cache", paged_v_cache),
+            ("k_scale_cache", k_scale_cache),
+            ("v_scale_cache", v_scale_cache),
+            ("k_scale", k_scale_tensor),
+            ("v_scale", v_scale_tensor),
+            ("q_input", q_input),
+        ):
+            other_start, other_end = _q_byte_span(other)
+            if q_output_start < other_end and other_start < q_output_end:
+                raise ValueError(f"q_output must not overlap {other_name}")
+
+    # Context destinations are optional as one group, independently of fused Q.
+    _context_args = (context_dst_rows, context_k_output, context_v_output)
+    _has_context = context_dst_rows is not None
+    if any(value is not None for value in _context_args) != all(
+        value is not None for value in _context_args
+    ):
+        raise ValueError(
+            "context_dst_rows, context_k_output, and context_v_output "
+            "must be provided together"
+        )
+    if _has_context:
+        if append_key.shape[-1] != 256:
+            raise ValueError("fused context output is qualified only for H256")
+        if kv_layout != "HND":
+            raise ValueError("fused H256 context output requires HND KV layout")
+        if _is_stream_capturing_on_device(append_key.device):
+            raise ValueError(
+                "fused context output is not supported during CUDA graph capture"
+            )
+        if (
+            context_dst_rows.dtype != slot_mapping.dtype
+            or context_dst_rows.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("context_dst_rows must match the int32/int64 slot dtype")
+        if (
+            context_dst_rows.dim() != 1
+            or context_dst_rows.numel() != slot_mapping.numel()
+        ):
+            raise ValueError("context_dst_rows must have one entry per cache slot")
+        if not context_dst_rows.is_contiguous():
+            raise ValueError("context_dst_rows must be contiguous")
+        if context_dst_rows.device != append_key.device:
+            raise ValueError("context_dst_rows must be on the append device")
+        if (
+            context_k_output.dim() != 3
+            or context_v_output.shape != context_k_output.shape
+        ):
+            raise ValueError("context K/V outputs must be matching rank-3 tensors")
+        if (
+            context_k_output.dtype != torch.float8_e4m3fn
+            or context_v_output.dtype != torch.float8_e4m3fn
+        ):
+            raise ValueError("context K/V outputs must be float8_e4m3fn")
+        if (
+            context_k_output.shape[0] <= 0
+            or context_k_output.shape[1:] != append_key.shape[1:]
+        ):
+            raise ValueError("context K/V output head shape must match append K/V")
+        if (
+            context_k_output.device != append_key.device
+            or context_v_output.device != append_key.device
+        ):
+            raise ValueError("context K/V outputs must be on the append device")
+        for _context_name, _context_tensor in (
+            ("context_k_output", context_k_output),
+            ("context_v_output", context_v_output),
+        ):
+            if _context_tensor.stride(-1) != 1:
+                raise ValueError(
+                    f"{_context_name} must have a contiguous last dimension"
+                )
+            if _context_tensor.stride(1) < _context_tensor.shape[
+                2
+            ] or _context_tensor.stride(0) < _context_tensor.shape[
+                1
+            ] * _context_tensor.stride(1):
+                raise ValueError(f"{_context_name} rows and heads must not overlap")
+            if (_context_tensor.data_ptr() % 16) != 0 or any(
+                (stride * _context_tensor.element_size()) % 16 != 0
+                for stride in _context_tensor.stride()[:-1]
+            ):
+                raise ValueError(f"{_context_name} rows must be 16-byte aligned")
+
+        def _fused_context_byte_span(_tensor):
+            _max_element = sum(
+                (size - 1) * stride
+                for size, stride in zip(_tensor.shape, _tensor.stride(), strict=True)
+            )
+            _start = _tensor.data_ptr()
+            return (
+                _start,
+                _start + (_max_element + 1) * _tensor.element_size(),
+            )
+
+        _context_outputs = (
+            ("context_k_output", context_k_output),
+            ("context_v_output", context_v_output),
+        )
+        if q_output is not None:
+            _q_output_start, _q_output_end = _fused_context_byte_span(q_output)
+            _rows_start, _rows_end = _fused_context_byte_span(context_dst_rows)
+            if _q_output_start < _rows_end and _rows_start < _q_output_end:
+                raise ValueError("q_output must not overlap context_dst_rows")
+        _non_context_tensors = (
+            ("append_key", append_key),
+            ("append_value", append_value),
+            ("slot_mapping", slot_mapping),
+            ("context_dst_rows", context_dst_rows),
+            ("paged_k_cache", paged_k_cache),
+            ("paged_v_cache", paged_v_cache),
+            ("k_scale_cache", k_scale_cache),
+            ("v_scale_cache", v_scale_cache),
+            ("k_scale", k_scale_tensor),
+            ("v_scale", v_scale_tensor),
+            ("q_input", q_input),
+            ("q_output", q_output),
+        )
+        for _output_index, (_output_name, _output) in enumerate(_context_outputs):
+            _output_start, _output_end = _fused_context_byte_span(_output)
+            _others = _non_context_tensors + _context_outputs[_output_index + 1 :]
+            for _other_name, _other in _others:
+                if _other is None or _other.numel() == 0:
+                    continue
+                _other_start, _other_end = _fused_context_byte_span(_other)
+                if _output_start < _other_end and _other_start < _output_end:
+                    raise ValueError(f"{_output_name} must not overlap {_other_name}")
+
+    _check_nvfp4_append_vector_alignment(
+        append_key, append_value, paged_k_cache, paged_v_cache
+    )
     _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
         append_key,
         append_value,
@@ -847,4 +1115,9 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         k_scale_tensor,
         v_scale_tensor,
         TensorLayout[kv_layout].value,
+        q_input,
+        q_output,
+        context_dst_rows,
+        context_k_output,
+        context_v_output,
     )

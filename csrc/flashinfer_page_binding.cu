@@ -33,7 +33,11 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
 void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     TensorView append_key, TensorView append_value, TensorView slot_mapping,
     TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scale_cache,
-    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale, int64_t layout);
+    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale,
+    tvm::ffi::Optional<TensorView> q_input, tvm::ffi::Optional<TensorView> q_output,
+    tvm::ffi::Optional<TensorView> context_dst_rows,
+    tvm::ffi::Optional<TensorView> context_k_output,
+    tvm::ffi::Optional<TensorView> context_v_output, int64_t layout);
 
 void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView batch_indices, TensorView positions, TensorView ckv_cache,
